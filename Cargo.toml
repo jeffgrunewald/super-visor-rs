@@ -1,0 +1,17 @@
+[package]
+name = "super-visor"
+version = "0.1.0"
+authors = ["Jeff Grunewald <jeff@grunewalddesign.com>"]
+license = "MIT OR Apache-2.0"
+description = "Simple ordered startup and shutdown for long-running tokio processes"
+repository = "https://github.com/jeffgrunewald/super-visor-rs"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", default-features = false, features = ["signal"] }
+tokio-util = "0"
+futures = "*"
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "time"] }
