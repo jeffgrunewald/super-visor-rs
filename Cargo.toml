@@ -3,8 +3,11 @@ name = "super-visor"
 version = "0.1.0"
 authors = ["Jeff Grunewald <jeff@grunewalddesign.com>"]
 license = "MIT OR Apache-2.0"
+readme = "README.md"
 description = "Simple ordered startup and shutdown for long-running tokio processes"
 repository = "https://github.com/jeffgrunewald/super-visor-rs"
+keywords = ["async", "proc", "manage"]
+categories = ["async", "concurrency", "process"]
 edition = "2021"
 
 [dependencies]
