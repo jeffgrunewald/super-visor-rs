@@ -8,7 +8,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::signal;
-use tokio_util::sync::CancellationToken;
+pub use tokio_util::sync::CancellationToken;
 
 fn root_shutdown() -> Result<LocalBoxFuture<'static, ()>> {
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
