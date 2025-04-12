@@ -7,7 +7,7 @@ Modeled after the application behavior in Erlang/Elixir, it's intention is to al
 It is based on the `task-manager` crate from the Helium Oracles project but removes the external dependency on the `triggered` crate to simplify the dependency requirements as well as provide the more granular control for future process tree strategies provided by tokio's native `CancellationToken` type.
 
 
-Any tokio process can be converted to a super-visor-managed process by having the central type implement the `ManagedProc` trait. This trait requires the `start_proc` function which takes a boxed `Self` and a `CancellationToken` and expects the implementer to set the process to listen for the token to be cancelled and take appropriate action to gracefully stop its work and return a `anyhow::Result<()>` to the caller.
+Any tokio process can be converted to a super-visor-managed process by having the central type implement the `ManagedProc` trait. This trait requires the `run_proc` function which takes a boxed `Self` and a `CancellationToken` and expects the implementer to set the process to listen for the token to be cancelled and take appropriate action to gracefully stop its work and return a `anyhow::Result<()>` to the caller.
 A Supervisor can itself be a supervised process, allowing for process grouping and nested orchestration.
 Finally, the application's `#[tokio::main]` function should utilize the `SupervisorBuilder` to construct a root process supervisor and then `start()` it, which will start all the managed processes added to its managed procs list in the order defined, and continue to drive them to completion (or indefinitely for servers) until the root process receives a `ctrl_c` or a `sigterm` from the OS.
 
@@ -19,28 +19,19 @@ struct AxumServer {
   ...
 }
 
-impl AxumServer {
-    async fn run_server(self, shutdown: CancellationToken) -> anyhow::Result<()> {
+impl ManagedProc for AxumServer {
+    async fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> anyhow::Result<()> {
         ...do some setup stuff...
 
-        axum::serve(
+        Box::pin(axum::serve(
             TcpListener::bind(&self.listen_addr)
                 .await
                 .expect("bind address error"),
             router.into_make_service(),
         )
-        .with_graceful_shutdown(shutdown.cancelled())
+        .with_graceful_shutdown(shutdown))
         .await
-        .map_err(anyhow::Error::from)
-    }
-}
-
-impl ManagedProc for AxumServer {
-    fn start_proc(
-        self: Box<Self>,
-        shutdown: CancellationToken,
-    ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<()>> {
-        Box::pin(self.run(shutdown))
+        .map_err(anyhow::Error::from))
     }
 }
 
@@ -53,11 +44,11 @@ impl SomeTask {
         Self { state }
     }
 
-    async fn big_recurring_task(&self, shutdown: CancellationToken) -> anyhow::Result<()> {
+    async fn big_recurring_task(&self, shutdown: ShutdownSignal) -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown.cancelled() => break,
+                _ = shutdown => break,
                 signal = self.state.listener.recv() => {
                     ...do something important...
                 }
@@ -69,9 +60,9 @@ impl SomeTask {
 }
 
 impl ManagedProc for SomeTask {
-    fn start_task(
+    fn run_proc(
         self: Box<Self>,
-        shutdown: CancellationToken,
+        shutdown: ShutdownSignal,
     ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<()>> {
         Box::pin(self.big_recurring_task(shutdown))
     }

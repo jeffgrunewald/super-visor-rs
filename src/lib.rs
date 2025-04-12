@@ -8,24 +8,30 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::signal;
-pub use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
-fn root_shutdown() -> Result<LocalBoxFuture<'static, ()>> {
-    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
-    Ok(Box::pin(
-        futures::future::select(
-            Box::pin(async move { sigterm.recv().await }),
-            Box::pin(signal::ctrl_c()),
-        )
-        .map(|_| ()),
-    ))
+pub struct ShutdownSignal {
+    future: Pin<Box<WaitForCancellationFutureOwned>>,
+}
+
+impl ShutdownSignal {
+    pub fn new(token: CancellationToken) -> Self {
+        Self {
+            future: Box::pin(token.cancelled_owned()),
+        }
+    }
+}
+
+impl Future for ShutdownSignal {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.future.as_mut().poll(cx)
+    }
 }
 
 pub trait ManagedProc {
-    fn start_proc(
-        self: Box<Self>,
-        shutdown: CancellationToken,
-    ) -> LocalBoxFuture<'static, Result<()>>;
+    fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> LocalBoxFuture<'static, Result<()>>;
 }
 
 pub struct Supervisor {
@@ -33,12 +39,8 @@ pub struct Supervisor {
 }
 
 impl ManagedProc for Supervisor {
-    fn start_proc(
-        self: Box<Self>,
-        shutdown: CancellationToken,
-    ) -> LocalBoxFuture<'static, Result<()>> {
-        let cancel_listener = shutdown.cancelled_owned();
-        Box::pin(self.do_start(Box::pin(cancel_listener)))
+    fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> LocalBoxFuture<'static, Result<()>> {
+        Box::pin(self.do_run(Box::pin(shutdown)))
     }
 }
 
@@ -59,15 +61,12 @@ impl Future for CancelableLocalFuture {
     }
 }
 
-impl<F, O> ManagedProc for F
+impl<O, P> ManagedProc for P
 where
     O: Future<Output = Result<()>> + 'static,
-    F: FnOnce(CancellationToken) -> O,
+    P: FnOnce(ShutdownSignal) -> O,
 {
-    fn start_proc(
-        self: Box<Self>,
-        shutdown: CancellationToken,
-    ) -> LocalBoxFuture<'static, Result<()>> {
+    fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> LocalBoxFuture<'static, Result<()>> {
         Box::pin(self(shutdown))
     }
 }
@@ -92,10 +91,18 @@ impl Supervisor {
     }
 
     pub async fn start(self) -> Result<()> {
-        self.do_start(root_shutdown()?).await
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+        let shutdown = Box::pin(
+            futures::future::select(
+                Box::pin(async move { sigterm.recv().await }),
+                Box::pin(signal::ctrl_c()),
+            )
+            .map(|_| ()),
+        );
+        self.do_run(shutdown).await
     }
 
-    async fn do_start(self, mut shutdown: LocalBoxFuture<'static, ()>) -> Result<()> {
+    async fn do_run(self, mut shutdown: LocalBoxFuture<'static, ()>) -> Result<()> {
         let mut futures = start_futures(self.procs);
 
         loop {
@@ -141,7 +148,7 @@ fn start_futures(procs: Vec<Box<dyn ManagedProc>>) -> Vec<CancelableLocalFuture>
             let child_token = cancel_token.child_token();
             CancelableLocalFuture {
                 cancel_token,
-                future: proc.start_proc(child_token),
+                future: proc.run_proc(ShutdownSignal::new(child_token)),
             }
         })
         .collect()
@@ -174,13 +181,13 @@ mod tests {
     }
 
     impl ManagedProc for TestProc {
-        fn start_proc(
+        fn run_proc(
             self: Box<Self>,
-            shutdown: CancellationToken,
+            shutdown: ShutdownSignal,
         ) -> LocalBoxFuture<'static, Result<()>> {
             let handle = tokio::spawn(async move {
                 tokio::select! {
-                    _ = shutdown.cancelled() => (),
+                    _ = shutdown => (),
                     _ = tokio::time::sleep(std::time::Duration::from_millis(self.delay)) => (),
                 }
                 self.sender.send(self.name).await.expect("unable to send");
