@@ -12,28 +12,28 @@ use futures::{
 
 #[derive(Debug)]
 #[must_use = "futures do nothing unless you `.await` them"]
-pub struct SelectAll<Fut> {
+pub struct OrderedSelectAll<Fut> {
     inner: Vec<Fut>,
 }
 
-pub fn select_all<I>(iter: I) -> SelectAll<I::Item>
+pub fn ordered_select_all<I>(iter: I) -> OrderedSelectAll<I::Item>
 where
     I: IntoIterator,
     I::Item: Future + Unpin,
 {
-    SelectAll {
+    OrderedSelectAll {
         inner: iter.into_iter().collect(),
     }
 }
 
-impl<Fut> SelectAll<Fut> {
+impl<Fut> OrderedSelectAll<Fut> {
     /// Consumes this combinator, returning the underlying futures.
     pub fn into_inner(self) -> Vec<Fut> {
         self.inner
     }
 }
 
-impl<Fut: Future + Unpin> Future for SelectAll<Fut> {
+impl<Fut: Future + Unpin> Future for OrderedSelectAll<Fut> {
     type Output = (Fut::Output, usize, Vec<Fut>);
 
     fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {

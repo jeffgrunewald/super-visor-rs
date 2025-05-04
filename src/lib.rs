@@ -1,6 +1,6 @@
-mod select_all;
+mod ordered_select_all;
 
-use crate::select_all::select_all;
+use crate::ordered_select_all::ordered_select_all;
 use anyhow::Result;
 use futures::{future::LocalBoxFuture, Future, FutureExt, StreamExt};
 use std::{
@@ -110,7 +110,7 @@ impl Supervisor {
                 break;
             }
 
-            let mut select = select_all(futures);
+            let mut select = ordered_select_all(futures);
 
             tokio::select! {
                 biased;
