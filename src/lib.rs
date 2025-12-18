@@ -11,14 +11,24 @@ use tokio::signal;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 pub struct ShutdownSignal {
-    future: Pin<Box<WaitForCancellationFutureOwned>>,
+    token: CancellationToken,
+    future: Option<Pin<Box<WaitForCancellationFutureOwned>>>,
 }
 
 impl ShutdownSignal {
     pub fn new(token: CancellationToken) -> Self {
         Self {
-            future: Box::pin(token.cancelled_owned()),
+            token,
+            future: None,
         }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    pub fn token(&self) -> &CancellationToken {
+        &self.token
     }
 }
 
@@ -26,9 +36,26 @@ impl Future for ShutdownSignal {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.future.as_mut().poll(cx)
+        // Lazy init the future on first poll
+        if self.future.is_none() {
+            self.future = Some(Box::pin(self.token.clone().cancelled_owned()));
+        }
+
+        // Poll the cached future
+        self.future.as_mut().unwrap().as_mut().poll(cx)
     }
 }
+
+impl Clone for ShutdownSignal {
+    fn clone(&self) -> Self {
+        Self {
+            token: self.token.clone(),
+            future: None,
+        }
+    }
+}
+
+impl Unpin for ShutdownSignal {}
 
 pub trait ManagedProc {
     fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> LocalBoxFuture<'static, Result<()>>;
