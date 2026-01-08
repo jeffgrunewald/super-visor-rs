@@ -1,8 +1,7 @@
 mod ordered_select_all;
 
 use crate::ordered_select_all::ordered_select_all;
-use anyhow::Result;
-use futures::{future::LocalBoxFuture, Future, FutureExt, StreamExt};
+use futures::{future::BoxFuture, Future, FutureExt, StreamExt, TryFutureExt};
 use std::{
     pin::{pin, Pin},
     task::{Context, Poll},
@@ -10,6 +9,52 @@ use std::{
 use tokio::signal;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
+/// A boxed error type for errors raised in calling code
+pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Error type returned from task operations
+#[derive(Debug, thiserror::Error)]
+pub enum SupervisorError {
+    /// Error setting up signal listeners
+    #[error("signal listener setup failed: {0}")]
+    Signal(#[from] std::io::Error),
+    /// Error from within the managed process
+    #[error("task failed: {0}")]
+    Process(#[source] BoxError),
+}
+
+impl SupervisorError {
+    /// Creates a `SupervisorError::Process` from any error type that can be converted to [`BoxError`].
+    ///
+    /// This is useful in `map_err` calls to convert user process errors:
+    ///
+    /// ```ignore
+    /// my_future.map_err(SupervisorError::from_err)
+    /// ```
+    pub fn from_err<E: Into<BoxError>>(err: E) -> Self {
+        Self::Process(err.into())
+    }
+}
+
+impl From<BoxError> for SupervisorError {
+    fn from(err: BoxError) -> Self {
+        Self::Process(err)
+    }
+}
+
+/// Result type for supervised process operations
+pub type ProcResult = Result<(), SupervisorError>;
+
+/// The return type for managed processes
+///
+/// A boxed future that returns [`super_visor::Result`] when complete.
+/// Processes should return `Ok(())` on successful shutdown or an error if something went wrong
+pub type ManagedFuture = futures::future::BoxFuture<'static, ProcResult>;
+
+/// An awaitable construct for signalling shutdown to supervised processes
+/// to complete work and exit on the next available await point
+/// Lazily instantiates the future when the future is first polled to allow cloning the underlying
+/// token and propagating shutdown signals from a single source in a  one-to-many relationship
 pub struct ShutdownSignal {
     token: CancellationToken,
     future: Option<Pin<Box<WaitForCancellationFutureOwned>>>,
@@ -57,31 +102,148 @@ impl Clone for ShutdownSignal {
 
 impl Unpin for ShutdownSignal {}
 
-pub trait ManagedProc {
-    fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> LocalBoxFuture<'static, Result<()>>;
+/// Spawns a future ito its own Tokio task.
+///
+/// Use this in [`ManagedProc::start_task`] implementations when your future
+/// is `Send + 'static`. This is the preferred approach as it allows the process
+/// to run independently on the Tokio runtime.
+///
+/// # Example
+///
+/// ```ignore
+/// impl ManagedProc for MyDaemon {
+///     fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> ManagedFuture {
+///         super_visor::spawn(self.run(shutdown))
+///     }
+/// }
+/// ```
+pub fn spawn<F, E>(fut: F) -> ManagedFuture
+where
+    F: Future<Output = Result<(), E>> + Send + 'static,
+    E: Into<BoxError> + Send + 'static,
+{
+    // tokio::spawn returns Result<Result<(), E>, JoinError>
+    Box::pin(tokio::spawn(fut).map(|result| match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(SupervisorError::from_err(e)),
+        Err(e) => Err(SupervisorError::from_err(e)),
+    }))
 }
 
+/// Boxes a future without spawning a separate managed task
+///
+/// Use this in [`ManagedProc::start_task`] impls when you want to run the future
+/// directly rather than spawning it. Prefer [`spawn`] when possible, as spawned
+/// tasks can run more efficiently on the Tokio runtime
+///
+/// # Example
+///
+/// ```ignore
+/// impl ManagedProc for MyLocalDaemon {
+///     fn start_task(self: Box<Self>, shutdown: ShutdownSignal) -> ManagedFuture {
+///         super_visor::run(self.run(shutdown))
+///     }
+/// }
+/// ```
+pub fn run<F, E>(fut: F) -> ManagedFuture
+where
+    F: Future<Output = Result<(), E>> + Send + 'static,
+    E: Into<BoxError> + 'static,
+{
+    Box::pin(fut.map_err(SupervisorError::from_err))
+}
+
+/// A trait for types that can be managed as long-running async tasks.
+///
+/// Implement this trait to make your type usable with [`Supervisor`].
+/// The trait is also automatically implemented for closures of the form
+/// `FnOnce(ShutdownSignal) -> Future<Output = ProcResult>`.
+///
+/// # Example
+///
+/// ```ignore
+/// use super_visor::{ManagedProc, ManagedFuture};
+///
+/// struct MyDaemon { /* ... */ }
+///
+/// impl ManagedProc for MyDaemon {
+///     fn start_task(self: Box<Self>, shutdown: ShutdownSignal) -> ManaagedFuture {
+///         super_visor::spawn(self.run_task_logic_in_some_loop(shutdown))
+///     }
+/// }
+/// ```
+pub trait ManagedProc: Send + Sync {
+    /// Starts the process and returns a future that completes when the work is complete
+    /// or runs indefinitely in a continual loop.
+    ///
+    /// The `shutdown` listener will be triggered when the supervisor wants to shut down
+    /// the process. Implementations should listen for this signal and clean up gracefully.
+    /// Listening typically involves awaiting the shutdown signal alongside the primary operational
+    /// logic of the managed task in a select function or macro, or checking the signal has completed
+    /// or been cancelled at await points in the control loop
+    fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> ManagedFuture;
+}
+
+/// Manages the lifecycle of multiple async workers with coordinated, ordered shutdown.
+///
+/// `Supervisor` runs all registered processes concurrently and handles graceful shutdown
+/// when receiving SIGTERM or Ctrl+C. Tasks are shutdown in reverse order of their initial
+/// registration (LIFO), allowing dependent tasks to stop their dependencies. This mimics the
+/// Patterns of process management hierarchy and dependency familiar in the OTP Erlang runtime.
+///
+/// # Example
+///
+/// ```ignore
+/// use super_visor::Supervisor;
+///
+/// // Using the builder pattern
+/// Supervisor::builder()
+///     .add_proc(server)
+///     .add_proc(worker)
+///     .build()
+///     .start()
+///     .await?;
+///
+/// // Or using direct construction
+/// let mut supervisor = Supervisor::new();
+/// supervisor.add(server);
+/// supervisor.add(worker);
+/// supervisor.start().await?;
+/// ```
 pub struct Supervisor {
     procs: Vec<Box<dyn ManagedProc>>,
 }
 
 impl ManagedProc for Supervisor {
-    fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> LocalBoxFuture<'static, Result<()>> {
-        Box::pin(self.do_run(Box::pin(shutdown)))
+    fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> ManagedFuture {
+        crate::run(self.do_run(Box::pin(shutdown)))
     }
 }
 
+/// Builder for constructing a [`Supervisor`].
+///
+/// # Example
+///
+/// ```ignore
+/// use super_visor::Supervisor;
+///
+/// let supervisor = Supervisor::builder()
+///     .add_proc(server)
+///     .add_proc(worker)
+///     .add_proc(sink)
+///     .build();
+/// ```
 pub struct SupervisorBuilder {
     procs: Vec<Box<dyn ManagedProc>>,
 }
 
 struct CancelableLocalFuture {
     cancel_token: CancellationToken,
-    future: LocalBoxFuture<'static, Result<()>>,
+    future: ManagedFuture,
 }
 
 impl Future for CancelableLocalFuture {
-    type Output = Result<()>;
+    type Output = ProcResult;
 
     fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         pin!(&mut self.future).poll(ctx)
@@ -90,10 +252,10 @@ impl Future for CancelableLocalFuture {
 
 impl<O, P> ManagedProc for P
 where
-    O: Future<Output = Result<()>> + 'static,
-    P: FnOnce(ShutdownSignal) -> O,
+    O: Future<Output = ProcResult> + Send + 'static,
+    P: FnOnce(ShutdownSignal) -> O + Send + Sync,
 {
-    fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> LocalBoxFuture<'static, Result<()>> {
+    fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> ManagedFuture {
         Box::pin(self(shutdown))
     }
 }
@@ -105,19 +267,31 @@ impl Default for Supervisor {
 }
 
 impl Supervisor {
+    /// Creates a new empty supervisor.
     pub fn new() -> Self {
         Self { procs: Vec::new() }
     }
 
+    /// Creates a new [`SupervisorBuilder`] for fluent task registration.
     pub fn builder() -> SupervisorBuilder {
         SupervisorBuilder { procs: Vec::new() }
     }
 
+    /// Adds a task to the supervisor
+    ///
+    /// Tasks are started in the order they are added and shutdown in the reverse order.
     pub fn add(&mut self, proc: impl ManagedProc + 'static) {
         self.procs.push(Box::new(proc));
     }
 
-    pub async fn start(self) -> Result<()> {
+    /// Starts all registered processes and waits for completion or shutdown.
+    ///
+    /// This method:
+    /// 1. Starts all processes concurrently
+    /// 2. Listens for SIGTERM or Ctrl+C signals
+    /// 3. On signal or error, shuts down all running processes in reverse order (LIFO)
+    /// 4. Returns the first error encountered or `Ok(())` if all tasks complete successfully
+    pub async fn start(self) -> ProcResult {
         let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
         let shutdown = Box::pin(
             futures::future::select(
@@ -129,7 +303,7 @@ impl Supervisor {
         self.do_run(shutdown).await
     }
 
-    async fn do_run(self, mut shutdown: LocalBoxFuture<'static, ()>) -> Result<()> {
+    async fn do_run(self, mut shutdown: BoxFuture<'static, ()>) -> ProcResult {
         let mut futures = start_futures(self.procs);
 
         loop {
@@ -157,11 +331,15 @@ impl Supervisor {
 }
 
 impl SupervisorBuilder {
+    /// Adds a process to the builder
+    ///
+    /// Processes are started in the order they are registered and shut down in reverse order.
     pub fn add_proc(mut self, proc: impl ManagedProc + 'static) -> Self {
         self.procs.push(Box::new(proc));
         self
     }
 
+    /// Consumes the builder and returns a configured [`Supervisor`].
     pub fn build(self) -> Supervisor {
         Supervisor { procs: self.procs }
     }
@@ -181,7 +359,7 @@ fn start_futures(procs: Vec<Box<dyn ManagedProc>>) -> Vec<CancelableLocalFuture>
         .collect()
 }
 
-async fn stop_all(procs: Vec<CancelableLocalFuture>) -> Result<()> {
+async fn stop_all(procs: Vec<CancelableLocalFuture>) -> ProcResult {
     futures::stream::iter(procs.into_iter().rev())
         .then(|proc| async move {
             proc.cancel_token.cancel();
@@ -196,22 +374,40 @@ async fn stop_all(procs: Vec<CancelableLocalFuture>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::anyhow;
-    use futures::TryFutureExt;
     use tokio::sync::mpsc;
+
+    #[allow(dead_code)]
+    fn assert_send_sync() {
+        fn is_send<T: Send>() {}
+        fn is_sync<T: Sync>() {}
+        is_send::<Supervisor>();
+        is_sync::<Supervisor>();
+    }
+
+    #[derive(Debug)]
+    struct TestError(&'static str);
+
+    impl std::fmt::Display for TestError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl std::error::Error for TestError {}
+
+    fn test_err(msg: &'static str) -> SupervisorError {
+        SupervisorError::from_err(TestError(msg))
+    }
 
     struct TestProc {
         name: &'static str,
         delay: u64,
-        result: Result<()>,
+        result: ProcResult,
         sender: mpsc::Sender<&'static str>,
     }
 
     impl ManagedProc for TestProc {
-        fn run_proc(
-            self: Box<Self>,
-            shutdown: ShutdownSignal,
-        ) -> LocalBoxFuture<'static, Result<()>> {
+        fn run_proc(self: Box<Self>, shutdown: ShutdownSignal) -> ManagedFuture {
             let handle = tokio::spawn(async move {
                 tokio::select! {
                     _ = shutdown => (),
@@ -221,11 +417,10 @@ mod tests {
                 self.result
             });
 
-            Box::pin(
-                handle
-                    .map_err(|err| err.into())
-                    .and_then(|result| async move { result }),
-            )
+            Box::pin(handle.map(|result| match result {
+                Ok(inner) => inner,
+                Err(e) => Err(SupervisorError::from_err(e)),
+            }))
         }
     }
 
@@ -269,7 +464,7 @@ mod tests {
             .add_proc(TestProc {
                 name: "2",
                 delay: 50,
-                result: Err(anyhow!("error")),
+                result: Err(test_err("error")),
                 sender: sender.clone(),
             })
             .add_proc(TestProc {
@@ -285,7 +480,7 @@ mod tests {
         assert_eq!(Some("2"), receiver.recv().await);
         assert_eq!(Some("3"), receiver.recv().await);
         assert_eq!(Some("1"), receiver.recv().await);
-        assert_eq!("error", result.unwrap_err().to_string());
+        assert_eq!("task failed: error", result.unwrap_err().to_string());
     }
 
     #[tokio::test]
@@ -302,13 +497,13 @@ mod tests {
             .add_proc(TestProc {
                 name: "2",
                 delay: 50,
-                result: Err(anyhow!("error")),
+                result: Err(test_err("error")),
                 sender: sender.clone(),
             })
             .add_proc(TestProc {
                 name: "3",
                 delay: 200,
-                result: Err(anyhow!("second error")),
+                result: Err(test_err("second error")),
                 sender: sender.clone(),
             })
             .build()
@@ -318,7 +513,7 @@ mod tests {
         assert_eq!(Some("2"), receiver.recv().await);
         assert_eq!(Some("3"), receiver.recv().await);
         assert_eq!(Some("1"), receiver.recv().await);
-        assert_eq!("error", result.unwrap_err().to_string());
+        assert_eq!("task failed: error", result.unwrap_err().to_string());
     }
 
     #[tokio::test]
@@ -343,7 +538,7 @@ mod tests {
                     .add_proc(TestProc {
                         name: "proc-2-2",
                         delay: 100,
-                        result: Err(anyhow!("error")),
+                        result: Err(test_err("error")),
                         sender: sender.clone(),
                     })
                     .add_proc(TestProc {
