@@ -1,17 +1,16 @@
 use crate::{
-    event::EventHook, AutoShutdown, Backoff, ChildId, ChildSpec, EventKind, Intensity,
-    ManagedFuture, ManagedProc, ProcResult, Restart, Shutdown, ShutdownSignal, Strategy,
-    SupervisorError, SupervisorEvent,
+    handle::{ChildInfo, ChildStatus, Command, HandleError, SupervisorHandle},
+    report::Reporter,
+    runtime::{launch, needs_restart, os_shutdown_signal, start_proc, RestartWindow},
+    AutoShutdown, Backoff, ChildId, ChildSpec, EventKind, Intensity, ManagedFuture, ManagedProc,
+    ProcResult, Restart, Shutdown, ShutdownSignal, Strategy, SupervisorError, SupervisorEvent,
 };
 use futures::{future::BoxFuture, FutureExt};
-use std::{
-    collections::{HashSet, VecDeque},
-    future::poll_fn,
-    panic::{catch_unwind, AssertUnwindSafe},
-    sync::Arc,
-    task::Poll,
+use std::{collections::HashSet, future::poll_fn, sync::Arc, task::Poll};
+use tokio::{
+    sync::mpsc,
+    time::{sleep_until, timeout, Instant},
 };
-use tokio::time::{sleep_until, timeout, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Starts children in order, restarts them by policy, and stops them in reverse order.
@@ -19,16 +18,17 @@ use tokio_util::sync::CancellationToken;
 pub struct Supervisor {
     config: Config,
     children: Vec<ChildSpec>,
+    handle: SupervisorHandle,
+    commands: mpsc::Receiver<Command>,
 }
 
 #[derive(Default)]
 struct Config {
-    name: Option<String>,
+    reporter: Reporter,
     strategy: Strategy,
     intensity: Intensity,
     backoff: Backoff,
     auto_shutdown: AutoShutdown,
-    on_event: Option<EventHook>,
 }
 
 /// Builder for a [`Supervisor`]; see the crate docs for an example
@@ -44,9 +44,12 @@ impl Default for Supervisor {
 
 impl Supervisor {
     pub fn new() -> Self {
+        let handle = SupervisorHandle::new();
         Self {
             config: Config::default(),
             children: Vec::new(),
+            commands: handle.bind(),
+            handle,
         }
     }
 
@@ -64,6 +67,11 @@ impl Supervisor {
 
     pub fn add_child(&mut self, spec: ChildSpec) {
         self.children.push(spec);
+    }
+
+    /// A handle to this supervisor; calls made before it starts wait until it is running
+    pub fn handle(&self) -> SupervisorHandle {
+        self.handle.clone()
     }
 
     /// Runs until SIGTERM or Ctrl+C, a significant-child auto shutdown, or escalation
@@ -102,7 +110,7 @@ impl ManagedProc for Supervisor {
 impl SupervisorBuilder {
     /// Names the supervisor in its events
     pub fn name(mut self, name: impl Into<String>) -> Self {
-        self.supervisor.config.name = Some(name.into());
+        self.supervisor.config.reporter.name = Some(name.into());
         self
     }
 
@@ -131,7 +139,14 @@ impl SupervisorBuilder {
     where
         F: Fn(&SupervisorEvent<'_>) + Send + Sync + 'static,
     {
-        self.supervisor.config.on_event = Some(Arc::new(hook));
+        self.supervisor.config.reporter.hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Serves `handle` from this supervisor; a factory passes the same handle to each instance
+    pub fn handle(mut self, handle: SupervisorHandle) -> Self {
+        self.supervisor.commands = handle.bind();
+        self.supervisor.handle = handle;
         self
     }
 
@@ -162,40 +177,24 @@ fn legacy_spec<P: ManagedProc + 'static>(position: usize, proc: P) -> ChildSpec 
 fn validate(children: &[ChildSpec]) -> ProcResult {
     let mut seen = HashSet::new();
     children.iter().try_for_each(|child| {
-        let invalid = |reason| SupervisorError::InvalidSpec {
-            id: child.id.clone(),
-            reason,
-        };
         if !seen.insert(&child.id) {
-            return Err(invalid("duplicate child id"));
+            return Err(SupervisorError::InvalidSpec {
+                id: child.id.clone(),
+                reason: "duplicate child id",
+            });
         }
-        if child.significant && child.restart == Restart::Permanent {
-            return Err(invalid("a significant child must not be permanent"));
-        }
-        Ok(())
+        validate_spec(child)
     })
 }
 
-fn os_shutdown_signal() -> Result<BoxFuture<'static, ()>, SupervisorError> {
-    #[cfg(unix)]
-    {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        Ok(async move {
-            tokio::select! {
-                _ = sigterm.recv() => (),
-                _ = tokio::signal::ctrl_c() => (),
-            }
-        }
-        .boxed())
+fn validate_spec(child: &ChildSpec) -> ProcResult {
+    if child.significant && child.restart == Restart::Permanent {
+        return Err(SupervisorError::InvalidSpec {
+            id: child.id.clone(),
+            reason: "a significant child must not be permanent",
+        });
     }
-    #[cfg(not(unix))]
-    {
-        Ok(async {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-        .boxed())
-    }
+    Ok(())
 }
 
 struct Running {
@@ -207,7 +206,10 @@ enum State {
     Idle,
     Running(Running),
     Pending(Instant),
+    /// Exited and not restarted; counts for auto shutdown
     Stopped,
+    /// Stopped by `terminate_child`; does not count for auto shutdown
+    Terminated,
 }
 
 struct Child {
@@ -215,15 +217,35 @@ struct Child {
     state: State,
 }
 
+impl Child {
+    fn info(&self) -> ChildInfo {
+        ChildInfo {
+            id: self.spec.id.clone(),
+            status: match self.state {
+                State::Idle => ChildStatus::Starting,
+                State::Running(_) => ChildStatus::Running,
+                State::Pending(_) => ChildStatus::Restarting,
+                State::Stopped | State::Terminated => ChildStatus::Stopped,
+            },
+            restart: self.spec.restart,
+        }
+    }
+}
+
 struct Runtime {
     config: Config,
     children: Vec<Child>,
-    restarts: VecDeque<Instant>,
+    window: RestartWindow,
+    commands: mpsc::Receiver<Command>,
 }
+
+/// What the main loop does after a step that can end the supervisor
+type Step = Option<ProcResult>;
 
 impl Runtime {
     fn new(supervisor: Supervisor) -> Self {
         Self {
+            window: RestartWindow::new(supervisor.config.intensity),
             config: supervisor.config,
             children: supervisor
                 .children
@@ -233,7 +255,7 @@ impl Runtime {
                     state: State::Idle,
                 })
                 .collect(),
-            restarts: VecDeque::new(),
+            commands: supervisor.commands,
         }
     }
 
@@ -241,14 +263,15 @@ impl Runtime {
         &self.children[idx].spec.id
     }
 
+    fn position(&self, id: &ChildId) -> Result<usize, HandleError> {
+        self.children
+            .iter()
+            .position(|child| &child.spec.id == id)
+            .ok_or_else(|| HandleError::NotFound(id.clone()))
+    }
+
     fn emit(&self, idx: usize, kind: EventKind<'_>) {
-        if let Some(hook) = &self.config.on_event {
-            hook(&SupervisorEvent {
-                supervisor: self.config.name.as_deref(),
-                child: self.id(idx),
-                kind,
-            });
-        }
+        self.config.reporter.emit(self.id(idx), kind);
     }
 
     async fn supervise(mut self, mut shutdown: BoxFuture<'static, ()>) -> ProcResult {
@@ -257,26 +280,28 @@ impl Runtime {
                 return self.stop_all().await;
             }
             let next_due = self.next_pending();
-            tokio::select! {
+            let step = tokio::select! {
                 biased;
                 _ = &mut shutdown => return self.stop_all().await,
                 (idx, result) = next_exit(&mut self.children) => {
                     self.children[idx].state = State::Stopped;
                     let error = result.err();
                     self.emit(idx, EventKind::Exited { error: error.as_ref() });
-                    self.on_exit(idx, error).await?;
+                    self.on_exit(idx, error).await.err().map(Err)
                 }
                 _ = sleep_until(next_due.unwrap_or_else(Instant::now)), if next_due.is_some() => {
-                    if let Some(result) = self.start_due(&mut shutdown).await {
-                        return result;
-                    }
+                    self.start_due(&mut shutdown).await
                 }
+                Some(command) = self.commands.recv() => self.on_command(command, &mut shutdown).await,
+            };
+            if let Some(result) = step {
+                return result;
             }
         }
     }
 
     /// Starts the children whose restart is due, in start order
-    async fn start_due(&mut self, shutdown: &mut BoxFuture<'static, ()>) -> Option<ProcResult> {
+    async fn start_due(&mut self, shutdown: &mut BoxFuture<'static, ()>) -> Step {
         let now = Instant::now();
         for idx in 0..self.children.len() {
             if !matches!(self.children[idx].state, State::Pending(at) if at <= now) {
@@ -298,16 +323,7 @@ impl Runtime {
     }
 
     async fn start(&mut self, idx: usize) -> ProcResult {
-        let start = self.children[idx].spec.start_future().ok_or_else(|| {
-            SupervisorError::MaxIntensity {
-                id: self.id(idx).clone(),
-                source: None,
-            }
-        })?;
-        let proc = AssertUnwindSafe(start)
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|payload| Err(SupervisorError::from_panic(payload)))?;
+        let proc = start_proc(&mut self.children[idx].spec).await?;
         let token = CancellationToken::new();
         self.children[idx].state = State::Running(Running {
             future: launch(proc, ShutdownSignal::new(token.clone())),
@@ -319,26 +335,12 @@ impl Runtime {
 
     /// Applies the restart policy after child `idx` exited without a shutdown signal
     async fn on_exit(&mut self, idx: usize, error: Option<SupervisorError>) -> ProcResult {
-        let restart = match self.children[idx].spec.restart {
-            Restart::Permanent => true,
-            Restart::Transient => error.is_some(),
-            Restart::Temporary => false,
-        };
-        if !restart {
+        if !needs_restart(self.children[idx].spec.restart, error.as_ref()) {
             return Ok(());
         }
 
         let now = Instant::now();
-        self.restarts.push_back(now);
-        let period = self.config.intensity.period;
-        while self
-            .restarts
-            .front()
-            .is_some_and(|at| now.duration_since(*at) > period)
-        {
-            self.restarts.pop_front();
-        }
-
+        let restarts = self.window.record(now);
         let (restart_group, removed): (Vec<usize>, Vec<usize>) = self
             .restart_scope(idx)
             .filter(|&i| {
@@ -349,7 +351,7 @@ impl Runtime {
                     )
             })
             .partition(|&i| i == idx || self.children[i].spec.restart != Restart::Temporary);
-        let exceeded = self.restarts.len() > self.config.intensity.max_restarts as usize
+        let exceeded = self.window.exceeded()
             || restart_group
                 .iter()
                 .any(|&i| !self.children[i].spec.can_restart());
@@ -368,12 +370,119 @@ impl Runtime {
             let _ = self.stop_child(i).await;
         }
 
-        let delay = self.config.backoff.delay(self.restarts.len());
+        let delay = self.config.backoff.delay(restarts);
         restart_group.into_iter().for_each(|i| {
             self.children[i].state = State::Pending(now + delay);
             self.emit(i, EventKind::Restarting { delay });
         });
         Ok(())
+    }
+
+    async fn on_command(
+        &mut self,
+        command: Command,
+        shutdown: &mut BoxFuture<'static, ()>,
+    ) -> Step {
+        match command {
+            Command::StartChild(spec, reply) => {
+                if self.position(&spec.id).is_ok() {
+                    let _ = reply.send(Err(HandleError::AlreadyPresent(spec.id.clone())));
+                    return None;
+                }
+                if let Err(error) = validate_spec(&spec) {
+                    let _ = reply.send(Err(HandleError::Start(error)));
+                    return None;
+                }
+                self.children.push(Child {
+                    spec,
+                    state: State::Idle,
+                });
+                let idx = self.children.len() - 1;
+                let (step, result) = self.start_by_command(idx, shutdown).await;
+                if result.is_err() {
+                    self.children.remove(idx);
+                }
+                let _ = reply.send(result);
+                step
+            }
+            Command::RestartChild(id, reply) => {
+                let idx = match self.position(&id) {
+                    Ok(idx) => idx,
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return None;
+                    }
+                };
+                let refusal = match self.children[idx].state {
+                    State::Running(_) | State::Idle => Some(HandleError::Running(id)),
+                    State::Pending(_) => Some(HandleError::Restarting(id)),
+                    _ if !self.children[idx].spec.can_restart() => {
+                        Some(HandleError::NotRestartable(id))
+                    }
+                    _ => None,
+                };
+                if let Some(refusal) = refusal {
+                    let _ = reply.send(Err(refusal));
+                    return None;
+                }
+                let (step, result) = self.start_by_command(idx, shutdown).await;
+                let _ = reply.send(result);
+                step
+            }
+            Command::TerminateChild(id, reply) => {
+                let result = match self.position(&id) {
+                    Ok(idx) => {
+                        let _ = self.stop_child(idx).await;
+                        self.children[idx].state = State::Terminated;
+                        if self.children[idx].spec.restart == Restart::Temporary {
+                            self.children.remove(idx);
+                        }
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+                None
+            }
+            Command::DeleteChild(id, reply) => {
+                let result = self
+                    .position(&id)
+                    .and_then(|idx| match self.children[idx].state {
+                        State::Running(_) | State::Idle => Err(HandleError::Running(id)),
+                        State::Pending(_) => Err(HandleError::Restarting(id)),
+                        State::Stopped | State::Terminated => {
+                            self.children.remove(idx);
+                            Ok(())
+                        }
+                    });
+                let _ = reply.send(result);
+                None
+            }
+            Command::WhichChildren(reply) => {
+                let _ = reply.send(Ok(self.children.iter().map(Child::info).collect()));
+                None
+            }
+        }
+    }
+
+    /// Starts a child for a handle call; a failed start leaves it terminated
+    async fn start_by_command(
+        &mut self,
+        idx: usize,
+        shutdown: &mut BoxFuture<'static, ()>,
+    ) -> (Step, Result<(), HandleError>) {
+        tokio::select! {
+            biased;
+            _ = &mut *shutdown => (Some(self.stop_all().await), Err(HandleError::NotRunning)),
+            result = self.start(idx) => match result {
+                Ok(()) => (None, Ok(())),
+                Err(error) => {
+                    self.children[idx].state = State::Terminated;
+                    self.emit(idx, EventKind::StartFailed { error: &error });
+                    (None, Err(HandleError::Start(error)))
+                }
+            }
+        }
     }
 
     fn restart_scope(&self, idx: usize) -> std::ops::Range<usize> {
@@ -447,19 +556,6 @@ impl Runtime {
                 }
             }
         }
-    }
-}
-
-/// Runs the process, treating a panic at any point as an abnormal exit
-fn launch(proc: Box<dyn ManagedProc>, shutdown: ShutdownSignal) -> ManagedFuture {
-    match catch_unwind(AssertUnwindSafe(|| proc.run_proc(shutdown))) {
-        Ok(future) => AssertUnwindSafe(future)
-            .catch_unwind()
-            .map(|result| {
-                result.unwrap_or_else(|payload| Err(SupervisorError::from_panic(payload)))
-            })
-            .boxed(),
-        Err(payload) => futures::future::ready(Err(SupervisorError::from_panic(payload))).boxed(),
     }
 }
 

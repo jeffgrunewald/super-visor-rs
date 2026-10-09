@@ -22,11 +22,12 @@ the OTP policy on top of it.
 | `one_for_one` / `one_for_all` / `rest_for_one` | `Strategy::{OneForOne, OneForAll, RestForOne}` |
 | `intensity` / `period` | `Intensity { max_restarts, period }` (default 1 in 5 s) |
 | `auto_shutdown` + `significant` | `AutoShutdown` + `ChildSpec::significant` |
-| SASL supervisor reports | `SupervisorBuilder::on_event` |
+| SASL supervisor reports | `on_event` hook, and `tracing` events with the `tracing` feature |
+| `supervisor:start_child` and the other `*_child` calls | `SupervisorHandle` |
+| `simple_one_for_one` / Elixir `DynamicSupervisor` | `DynamicSupervisor` |
 | normal exit / crash | `Ok(())` / `Err(_)` or a panic |
 
-Not included: a handle to add or remove children at runtime, a dynamic supervisor
-(`simple_one_for_one`), hot code upgrade, and distribution.
+Not included: hot code upgrade, distribution, and a global process registry.
 
 ### Exits and restarts
 
@@ -120,6 +121,83 @@ async fn main() -> Result<(), super_visor::SupervisorError> {
         .await
 }
 ```
+
+## Changing children at runtime
+
+`Supervisor::handle()` returns a `SupervisorHandle`. Its calls match the OTP functions:
+
+| Call | Effect |
+|---|---|
+| `start_child(spec)` | Adds the child after the existing children and waits for its init. A failed start does not keep the spec. |
+| `terminate_child(id)` | Stops the child by its `Shutdown` policy and keeps the spec (a `Temporary` spec is removed). It does not cause an auto shutdown. |
+| `restart_child(id)` | Starts a terminated child again. This does not count toward the intensity. |
+| `delete_child(id)` | Removes the spec of a child that is not running. |
+| `which_children()`, `count_children()` | Report the children and their status. |
+
+Calls made before the supervisor starts wait until it runs. After it stops, calls fail
+with `HandleError::NotRunning`. A child supervisor that restarts is a new instance, so
+create the handle once and give it to each instance from the factory:
+
+```rust,no_run
+use super_visor::{ChildSpec, Supervisor, SupervisorHandle};
+
+let workers = SupervisorHandle::new();
+let root = Supervisor::builder().child(ChildSpec::supervisor("workers", {
+    let workers = workers.clone();
+    move || Supervisor::builder().handle(workers.clone()).build()
+}));
+```
+
+## Dynamic supervisor
+
+A `DynamicSupervisor` starts with no children. You add them through its handle, for
+example one child for each connection or each key. Each child runs in its own task and
+restarts by itself (one-for-one), with the same restart types and intensity. Child ids
+must be unique among its current children. A child that ends for good is removed.
+`max_children` sets a limit. On shutdown all children stop at the same time, each with
+its own `Shutdown` limit. `restart_child` and `delete_child` return
+`HandleError::NotSupported`, as in OTP.
+
+```rust
+use super_visor::{
+    CancellationToken, ChildSpec, DynamicSupervisor, ManagedProc, ProcResult, ShutdownSignal,
+};
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let pool = DynamicSupervisor::builder().max_children(100).build();
+    let handle = pool.handle();
+    let token = CancellationToken::new();
+    let running = tokio::spawn(Box::new(pool).run_proc(ShutdownSignal::new(token.clone())));
+
+    for key in ["alpha", "beta"] {
+        let worker = || |shutdown: ShutdownSignal| async move {
+            shutdown.await;
+            ProcResult::Ok(())
+        };
+        handle.start_child(ChildSpec::new(key, worker)).await.unwrap();
+    }
+    assert_eq!(handle.count_children().await.unwrap().active, 2);
+
+    token.cancel();
+    running.await.unwrap().unwrap();
+}
+```
+
+## Tracing
+
+With the `tracing` feature, each supervisor event is also a `tracing` event with the
+fields `supervisor`, `child` and, where it applies, `error`, `delay_ms` or `timeout_ms`.
+The messages do not change, so log alerts can match on them:
+
+| Message | Level |
+|---|---|
+| `child started` | INFO |
+| `child exited` | INFO (normal exit), WARN (with `error`) |
+| `child failed to start` | ERROR |
+| `child restarting` | INFO |
+| `child killed after shutdown timeout` | WARN |
+| `supervisor reached max restart intensity` | ERROR |
 
 ## Migrating from 0.3
 

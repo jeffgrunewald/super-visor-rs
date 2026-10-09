@@ -12,9 +12,16 @@ edition = "2021"
 
 [dependencies]
 thiserror = "2"
-tokio = { version = "1", default-features = false, features = ["macros", "signal", "rt", "time"] }
+tokio = { version = "1.38", default-features = false, features = ["macros", "signal", "rt", "sync", "time"] }
 tokio-util = { version = "0.7.11", features = ["rt"] }
 futures = "0.3"
+tracing = { version = "0.1.40", optional = true, default-features = false, features = ["std"] }
+
+[features]
+default = []
+# Emit each supervisor event as a `tracing` event with a fixed message
+tracing = ["dep:tracing"]
 
 [dev-dependencies]
-tokio = { version = "1", default-features = false, features = ["macros", "net", "rt", "test-util", "time"] }
+tokio = { version = "1", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
+tracing = { version = "0.1.40", default-features = false, features = ["std"] }

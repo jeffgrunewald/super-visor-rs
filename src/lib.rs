@@ -1,12 +1,18 @@
 #![doc = include_str!("../README.md")]
 
+mod dynamic;
 mod error;
 mod event;
+mod handle;
+mod report;
+mod runtime;
 mod spec;
 mod supervisor;
 
+pub use dynamic::{DynamicSupervisor, DynamicSupervisorBuilder};
 pub use error::{BoxError, ProcResult, SupervisorError};
 pub use event::{EventKind, SupervisorEvent};
+pub use handle::{ChildCounts, ChildInfo, ChildStatus, HandleError, SupervisorHandle};
 pub use spec::{AutoShutdown, Backoff, ChildId, ChildSpec, Intensity, Restart, Shutdown, Strategy};
 pub use supervisor::{Supervisor, SupervisorBuilder};
 pub use tokio_util::sync::CancellationToken;

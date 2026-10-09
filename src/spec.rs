@@ -1,4 +1,4 @@
-use crate::{BoxError, ManagedProc, Supervisor, SupervisorError};
+use crate::{BoxError, ManagedProc, SupervisorError};
 use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 use std::{borrow::Cow, fmt, future::Future, sync::Arc, time::Duration};
 
@@ -185,10 +185,12 @@ impl ChildSpec {
         )
     }
 
-    /// A nested supervisor; it stops with [`Shutdown::Infinity`] so its own children stop in order
-    pub fn supervisor<F>(id: impl Into<ChildId>, factory: F) -> Self
+    /// A nested supervisor (static or dynamic); it stops with [`Shutdown::Infinity`]
+    /// so its own children have time to stop by their own policies
+    pub fn supervisor<F, S>(id: impl Into<ChildId>, factory: F) -> Self
     where
-        F: Fn() -> Supervisor + Send + Sync + 'static,
+        F: Fn() -> S + Send + Sync + 'static,
+        S: ManagedProc + 'static,
     {
         Self::new(id, factory).shutdown(Shutdown::Infinity)
     }
